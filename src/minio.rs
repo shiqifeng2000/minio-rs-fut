@@ -1,6 +1,6 @@
 /*
  * MinIO Rust Library for Amazon S3 Compatible Cloud Storage
- * Copyright 2019 MinIO, Inc.
+ * Copyright 2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,19 +13,29 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Author: Robin Shi
  */
 
 // use std::env;
 
-use futures::future::{self, Future};
-use futures::Stream;
+use chrono::{DateTime, Utc};
+use futures::future::{self, Future, FutureExt, TryFutureExt};
+// use futures::{Stream, StreamExt};
 use http;
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{body::Body, client, header, header::HeaderMap, Method, Request, Response, Uri};
+use hyper::{
+    body::{to_bytes, Body},
+    client, header,
+    header::HeaderMap,
+    Method, Response, Uri,
+};
 use hyper_tls::HttpsConnector;
-use std::{env, string::String};
-use time;
-use time::Tm;
+use std::{
+    env,
+    str::{self, FromStr},
+    string::String,
+};
 
 pub use types::BucketInfo;
 use types::{Err, GetObjectResp, ListObjectsResp, Region};
@@ -36,7 +46,7 @@ mod api;
 mod api_notification;
 mod net;
 mod sign;
-mod types;
+pub mod types;
 mod xml;
 use log::debug;
 mod woxml;
@@ -83,6 +93,7 @@ impl ConnClient {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     server: Uri,
     region: Region,
@@ -108,7 +119,7 @@ impl Client {
                         conn_client: if server_uri.scheme_str() == Some("http") {
                             ConnClient::HttpCC(client::Client::new())
                         } else {
-                            let https = HttpsConnector::new(4).unwrap();
+                            let https = HttpsConnector::new();
                             ConnClient::HttpsCC(
                                 client::Client::builder().build::<_, hyper::Body>(https),
                             )
@@ -130,7 +141,7 @@ impl Client {
     }
 
     fn add_host_header(&self, header_map: &mut HeaderMap) {
-        let host_val = match self.server.port_part() {
+        let host_val = match self.server.port() {
             Some(port) => format!("{}:{}", self.server.host().unwrap_or(""), port),
             None => self.server.host().unwrap_or("").to_string(),
         };
@@ -147,7 +158,7 @@ impl Client {
             server: "https://play.min.io:9000".parse::<Uri>().unwrap(),
             region: Region::new("us-east-1"),
             conn_client: {
-                let https = HttpsConnector::new(4).unwrap();
+                let https = HttpsConnector::new();
                 ConnClient::HttpsCC(client::Client::builder().build::<_, hyper::Body>(https))
             },
             credentials: Some(Credentials::new(
@@ -161,7 +172,7 @@ impl Client {
         &self,
         mut s3_req: S3Req,
         body_res: Result<Body, Err>,
-    ) -> impl Future<Item = Response<Body>, Error = Err> {
+    ) -> impl Future<Output = Result<Response<Body>, Err>> {
         let hmap = &mut s3_req.headers;
         self.add_host_header(hmap);
 
@@ -175,38 +186,68 @@ impl Client {
         let server_addr = self.server.to_string();
         let conn_client = self.conn_client.clone();
 
-        future::result(body_res)
-            .and_then(move |body| {
+        async { body_res }
+            .and_then(|body| async move {
                 s3_req.body = body;
                 let sign_hdrs = sign::sign_v4(&s3_req, creds, region);
                 debug!("signout: {:?}", sign_hdrs);
                 api::mk_request(&s3_req, &server_addr, &sign_hdrs)
             })
-            .and_then(move |req| {
-                println!("333{:?}", req);
-                conn_client.make_req(req).map_err(|e| Err::HyperErr(e))
-            })
-            .and_then(|resp| {
+            .and_then(move |req| conn_client.make_req(req).map_err(|e| Err::HyperErr(e)))
+            .and_then(|resp| async {
                 let st = resp.status();
-                if st.is_success() {
-                    Ok(resp)
+                if st == hyper::StatusCode::OK {
+                    return Ok(resp);
                 } else {
-                    Err(Err::RawSvcErr(st, resp))
+                    return Err(Err::RawSvcErr(st, resp));
                 }
+                // println!("55511:{:?}", resp);
+                // if let Some(st_v) = st_check {
+                //   let st_c = st_v.to_str();
+                //   println!("66622:{:?}", st_c);
+                //   if let Ok(st) = st_c {
+                //     if st == "200" {
+                //       return Ok(resp);
+                //     } else {
+                //       return Err(Err::RawSvcErr(
+                //         hyper::StatusCode::from_str(st)
+                //           .unwrap_or(hyper::StatusCode::from_u16(500).unwrap()),
+                //         resp,
+                //       ));
+                //     }
+                //   }
+                // }
+                // Err(Err::RawSvcErr(
+                //   hyper::StatusCode::from_u16(500).unwrap(),
+                //   resp,
+                // ))
+                // let st = resp.head.status();
+                // if st.is_success() {
+                //   Ok(resp)
+                // } else {
+                //   Err(Err::RawSvcErr(st, resp))
+                // }
             })
             .or_else(|err| {
                 future::err(err)
-                    .or_else(|x| match x {
-                        Err::RawSvcErr(st, resp) => Ok((st, resp)),
-                        other_err => Err(other_err),
+                    .or_else(|x| async {
+                        match x {
+                            Err::RawSvcErr(st, resp) => Ok((st, resp)),
+                            other_err => Err(other_err),
+                        }
                     })
-                    .and_then(|(st, resp)| {
-                        resp.into_body()
-                            .concat2()
+                    .and_then(|(st, resp): (hyper::StatusCode, Response<Body>)| {
+                        to_bytes(resp.into_body())
                             .map_err(|err| Err::HyperErr(err))
-                            .and_then(move |chunk| {
-                                Err(Err::FailStatusCodeErr(st, chunk.into_bytes()))
-                            })
+                            .and_then(
+                                move |chunk| async move { Err(Err::FailStatusCodeErr(st, chunk)) },
+                            )
+                        // resp.into_body()
+                        //     .concat2()
+                        //     .map_err(|err| Err::HyperErr(err))
+                        //     .and_then(move |chunk| {
+                        //         Err(Err::FailStatusCodeErr(st, chunk.into_bytes()))
+                        //     })
                     })
             })
     }
@@ -215,7 +256,7 @@ impl Client {
         &self,
         mut s3_req: S3Req,
         body_res: Result<Body, Err>,
-    ) -> impl Future<Item = Response<Body>, Error = Err> {
+    ) -> impl Future<Output = Result<Response<Body>, Err>> {
         let hmap = &mut s3_req.headers;
         self.add_host_header(hmap);
 
@@ -229,35 +270,66 @@ impl Client {
         let server_addr = self.server.to_string();
         let conn_client = self.conn_client.clone();
 
-        future::result(body_res)
-            .and_then(move |body| {
+        async { body_res }
+            .and_then(|body| async move {
                 s3_req.body = body;
                 let sign_hdrs = sign::sign_v4(&s3_req, creds, region);
                 debug!("signout: {:?}", sign_hdrs);
                 api::mk_upload_request(s3_req, &server_addr, &sign_hdrs)
             })
             .and_then(move |req| conn_client.make_req(req).map_err(|e| Err::HyperErr(e)))
-            .and_then(|resp| {
+            .and_then(|resp| async {
+                let st_check = resp.headers().get("status");
                 let st = resp.status();
-                if st.is_success() {
-                    Ok(resp)
+                if st == hyper::StatusCode::OK {
+                    return Ok(resp);
                 } else {
-                    Err(Err::RawSvcErr(st, resp))
+                    return Err(Err::RawSvcErr(st, resp));
                 }
+                // if let Some(st_v) = st_check {
+                //   let st_check = st_v.to_str();
+                //   if let Ok(st) = st_check {
+                //     if st == "200" {
+                //       return Ok(resp);
+                //     } else {
+                //       return Err(Err::RawSvcErr(
+                //         hyper::StatusCode::from_str(st)
+                //           .unwrap_or(hyper::StatusCode::from_u16(500).unwrap()),
+                //         resp,
+                //       ));
+                //     }
+                //   }
+                // }
+                // Err(Err::RawSvcErr(
+                //   hyper::StatusCode::from_u16(500).unwrap(),
+                //   resp,
+                // ))
+                // if st.is_success() {
+                //   Ok(resp)
+                // } else {
+                //   Err(Err::RawSvcErr(st, resp))
+                // }
             })
             .or_else(|err| {
                 future::err(err)
-                    .or_else(|x| match x {
-                        Err::RawSvcErr(st, resp) => Ok((st, resp)),
-                        other_err => Err(other_err),
+                    .or_else(|x| async {
+                        match x {
+                            Err::RawSvcErr(st, resp) => Ok((st, resp)),
+                            other_err => Err(other_err),
+                        }
                     })
-                    .and_then(|(st, resp)| {
-                        resp.into_body()
-                            .concat2()
+                    .and_then(|(st, resp): (hyper::StatusCode, Response<Body>)| {
+                        to_bytes(resp.into_body())
                             .map_err(|err| Err::HyperErr(err))
-                            .and_then(move |chunk| {
-                                Err(Err::FailStatusCodeErr(st, chunk.into_bytes()))
-                            })
+                            .and_then(
+                                move |chunk| async move { Err(Err::FailStatusCodeErr(st, chunk)) },
+                            )
+                        // resp.into_body()
+                        //     .concat2()
+                        //     .map_err(|err| Err::HyperErr(err))
+                        //     .and_then(move |chunk| {
+                        //         Err(Err::FailStatusCodeErr(st, chunk.into_bytes()))
+                        //     })
                     })
             })
     }
@@ -265,7 +337,7 @@ impl Client {
     pub fn get_bucket_location(
         &self,
         bucket_name: &str,
-    ) -> impl Future<Item = Region, Error = Err> {
+    ) -> impl Future<Output = Result<Region, Err>> {
         let mut qp = Values::new();
         qp.set_value("location", None);
 
@@ -276,20 +348,26 @@ impl Client {
             headers: HeaderMap::new(),
             query: qp,
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_req_future(s3_req, Ok(Body::empty()))
             .and_then(|resp| {
-                // Read the whole body for bucket location response.
-                resp.into_body()
-                    .concat2()
+                to_bytes(resp.into_body())
                     .map_err(|err| Err::HyperErr(err))
-                    .and_then(move |chunk| chunk_to_string(&chunk))
-                    .and_then(|s| xml::parse_bucket_location(s))
+                    .and_then(|chunk| async move {
+                        xml::parse_bucket_location(
+                            String::from_utf8_lossy(&chunk.clone()).to_string(),
+                        )
+                    })
+                // resp.into_body()
+                //     .concat2()
+                //     .map_err(|err| Err::HyperErr(err))
+                //     .and_then(move |chunk| chunk_to_string(&chunk))
+                //     .and_then(|s| xml::parse_bucket_location(s))
             })
     }
 
-    pub fn delete_bucket(&self, bucket_name: &str) -> impl Future<Item = (), Error = Err> {
+    pub fn delete_bucket(&self, bucket_name: &str) -> impl Future<Output = Result<(), Err>> {
         let s3_req = S3Req {
             method: Method::DELETE,
             bucket: Some(bucket_name.to_string()),
@@ -297,17 +375,17 @@ impl Client {
             headers: HeaderMap::new(),
             query: Values::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_req_future(s3_req, Ok(Body::empty()))
-            .and_then(|_| Ok(()))
+            .and_then(|_| async { Ok(()) })
     }
 
     pub fn delete_bucket_obj(
         &self,
         bucket_name: &str,
         key: &str,
-    ) -> impl Future<Item = (), Error = Err> {
+    ) -> impl Future<Output = Result<(), Err>> {
         let s3_req = S3Req {
             method: Method::DELETE,
             bucket: Some(bucket_name.to_string()),
@@ -315,13 +393,13 @@ impl Client {
             headers: HeaderMap::new(),
             query: Values::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_req_future(s3_req, Ok(Body::empty()))
-            .and_then(|_| Ok(()))
+            .and_then(|_| async { Ok(()) })
     }
 
-    pub fn bucket_exists(&self, bucket_name: &str) -> impl Future<Item = bool, Error = Err> {
+    pub fn bucket_exists(&self, bucket_name: &str) -> impl Future<Output = Result<bool, Err>> {
         let s3_req = S3Req {
             method: Method::HEAD,
             bucket: Some(bucket_name.to_string()),
@@ -329,20 +407,22 @@ impl Client {
             headers: HeaderMap::new(),
             query: Values::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_req_future(s3_req, Ok(Body::empty()))
-            .then(|res| match res {
-                Ok(_) => Ok(true),
-                Err(Err::FailStatusCodeErr(st, b)) => {
-                    let code = st.as_u16();
-                    if code == 404 {
-                        Ok(false)
-                    } else {
-                        Err(Err::FailStatusCodeErr(st, b))
+            .then(|res| async {
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(Err::FailStatusCodeErr(st, b)) => {
+                        let code = st.as_u16();
+                        if code == 404 {
+                            Ok(false)
+                        } else {
+                            Err(Err::FailStatusCodeErr(st, b))
+                        }
                     }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(err),
             })
     }
 
@@ -351,7 +431,7 @@ impl Client {
         bucket_name: &str,
         key: &str,
         get_obj_opts: Vec<(HeaderName, HeaderValue)>,
-    ) -> impl Future<Item = GetObjectResp, Error = Err> {
+    ) -> impl Future<Output = Result<GetObjectResp, Err>> {
         let mut h = HeaderMap::new();
         get_obj_opts
             .iter()
@@ -367,14 +447,14 @@ impl Client {
             headers: h,
             query: Values::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
 
         self.signed_req_future(s3_req, Ok(Body::empty()))
-            .and_then(GetObjectResp::new)
+            .and_then(|body| async { GetObjectResp::new(body) })
     }
 
-    pub fn make_bucket(&self, bucket_name: &str) -> impl Future<Item = (), Error = Err> {
+    pub fn make_bucket(&self, bucket_name: &str) -> impl Future<Output = Result<(), Err>> {
         let xml_body_res = xml::get_mk_bucket_body();
         let bucket = bucket_name.clone().to_string();
         let s3_req = S3Req {
@@ -384,9 +464,8 @@ impl Client {
             query: Values::new(),
             headers: HeaderMap::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
-        println!("--{:?}", time::now_utc());
         self.signed_req_future(s3_req, xml_body_res)
             .and_then(|_| future::ok(()))
     }
@@ -396,7 +475,7 @@ impl Client {
         bucket_name: &str,
         key: &str,
         body: Body,
-    ) -> impl Future<Item = (), Error = Err> {
+    ) -> impl Future<Output = Result<(), Err>> {
         // let xml_body_res = xml::get_mk_bucket_body();
         let bucket = bucket_name.clone().to_string();
         let s3_req = S3Req {
@@ -406,13 +485,13 @@ impl Client {
             query: Values::new(),
             headers: HeaderMap::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_upload_future(s3_req, Ok(body))
             .and_then(|_| future::ok(()))
     }
 
-    pub fn list_buckets(&self) -> impl Future<Item = Vec<BucketInfo>, Error = Err> {
+    pub fn list_buckets(&self) -> impl Future<Output = Result<Vec<BucketInfo>, Err>> {
         let s3_req = S3Req {
             method: Method::GET,
             bucket: None,
@@ -420,16 +499,17 @@ impl Client {
             query: Values::new(),
             headers: HeaderMap::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_req_future(s3_req, Ok(Body::empty()))
             .and_then(|resp| {
-                // Read the whole body for list buckets response.
-                resp.into_body()
-                    .concat2()
+                to_bytes(resp.into_body())
                     .map_err(|err| Err::HyperErr(err))
-                    .and_then(move |chunk| chunk_to_string(&chunk))
-                    .and_then(|s| xml::parse_bucket_list(s))
+                    .and_then(|chunk| async move {
+                        xml::parse_bucket_list(String::from_utf8_lossy(&chunk).to_string())
+                    })
+                // .and_then(move |chunk| async { String::from_utf8_lossy(&chunk) })
+                // .and_then(|s| async { xml::parse_bucket_list(s) })
             })
     }
 
@@ -440,7 +520,7 @@ impl Client {
         marker: Option<&str>,
         delimiter: Option<&str>,
         max_keys: Option<i32>,
-    ) -> impl Future<Item = ListObjectsResp, Error = Err> {
+    ) -> impl Future<Output = Result<ListObjectsResp, Err>> {
         let mut qparams: Values = Values::new();
         qparams.set_value("list-type", Some("2".to_string()));
         if let Some(d) = delimiter {
@@ -465,43 +545,43 @@ impl Client {
             query: qparams,
             headers: HeaderMap::new(),
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         self.signed_req_future(s3_req, Ok(Body::empty()))
             .and_then(|resp| {
-                resp.into_body()
-                    .concat2()
+                to_bytes(resp.into_body())
                     .map_err(|err| Err::HyperErr(err))
-                    .and_then(move |chunk| chunk_to_string(&chunk))
-                    .and_then(|s| xml::parse_list_objects(s))
+                    .and_then(|chunk| async move {
+                        xml::parse_list_objects(String::from_utf8_lossy(&chunk).to_string())
+                    })
             })
     }
 }
 
-fn run_req_future(
-    req_result: Result<Request<Body>, Err>,
-    c: ConnClient,
-) -> impl Future<Item = Response<Body>, Error = Err> {
-    future::result(req_result)
-        //.map_err(|e| Err::HttpErr(e))
-        .and_then(move |req| c.make_req(req).map_err(|e| Err::HyperErr(e)))
-        .and_then(|resp| {
-            let st = resp.status();
-            if st.is_success() {
-                Ok(resp)
-            } else {
-                Err(Err::RawSvcErr(st, resp))
-            }
-        })
-}
+// fn run_req_future(
+//     req_result: Result<Request<Body>, Err>,
+//     c: ConnClient,
+// ) -> impl Future<Output = Result<Response<Body>, Err>> {
+//     future::result(req_result)
+//         //.map_err(|e| Err::HttpErr(e))
+//         .and_then(move |req| c.make_req(req).map_err(|e| Err::HyperErr(e)))
+//         .and_then(|resp| {
+//             let st = resp.status();
+//             if st.is_success() {
+//                 Ok(resp)
+//             } else {
+//                 Err(Err::RawSvcErr(st, resp))
+//             }
+//         })
+// }
 
 /// Converts a `hyper::Chunk` into a string.
-fn chunk_to_string(chunk: &hyper::Chunk) -> Result<String, Err> {
-    match String::from_utf8(chunk.to_vec()) {
-        Err(e) => Err(Err::Utf8DecodingErr(e)),
-        Ok(s) => Ok(s.to_string()),
-    }
-}
+// fn chunk_to_string(chunk: &hyper::Chunk) -> Result<String, Err> {
+//     match String::from_utf8(chunk.to_vec()) {
+//         Err(e) => Err(Err::Utf8DecodingErr(e)),
+//         Ok(s) => Ok(s.to_string()),
+//     }
+// }
 
 pub struct S3Req {
     method: Method,
@@ -510,7 +590,7 @@ pub struct S3Req {
     headers: HeaderMap,
     query: Values,
     body: Body,
-    ts: Tm,
+    ts: DateTime<Utc>,
 }
 
 impl S3Req {
@@ -569,7 +649,7 @@ mod minio_tests {
             headers: HeaderMap::new(),
             query: query_params,
             body: Body::empty(),
-            ts: time::now_utc(),
+            ts: Utc::now(),
         };
         let result = s3_req.mk_query();
         assert!(result.contains("key1=val1"));

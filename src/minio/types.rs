@@ -16,16 +16,18 @@
  */
 
 use bytes::Bytes;
-use futures::stream::Stream;
+// use futures::stream::Stream;
 use hyper::header::{
     HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE,
     CONTENT_LENGTH, CONTENT_TYPE, ETAG, EXPIRES,
 };
+// use hyper::rt::Stream;
+use chrono::{DateTime, TimeZone, Utc};
 use hyper::{body::Body, Response};
 use roxmltree;
 use std::collections::HashMap;
 use std::string;
-use time::{strptime, Tm};
+// use time::{strptime, Tm};
 
 #[derive(Clone)]
 pub struct Region(String);
@@ -104,9 +106,9 @@ impl GetObjectResp {
     }
 
     // Consumes GetObjectResp
-    pub fn get_object_stream(self) -> impl Stream<Item = hyper::Chunk, Error = Err> {
-        self.resp.into_body().map_err(|err| Err::HyperErr(err))
-    }
+    // pub fn get_object_stream(self) -> impl Stream<Item = hyper::Chunk, Error = Err> {
+    //     self.resp.into_body().map_err(|err| Err::HyperErr(err))
+    // }
 }
 
 fn hv2s(o: Option<&HeaderValue>) -> Option<String> {
@@ -121,15 +123,15 @@ fn extract_user_meta(h: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-fn parse_aws_time(time_str: &str) -> Result<Tm, Err> {
-    strptime(time_str, "%Y-%m-%dT%H:%M:%S.%Z")
+fn parse_aws_time(time_str: &str) -> Result<DateTime<Utc>, Err> {
+    Utc.datetime_from_str(time_str, "%Y-%m-%dT%H:%M:%S.%Z")
         .map_err(|err| Err::InvalidTmFmt(format!("{:?}", err)))
 }
 
 #[derive(Debug)]
 pub struct BucketInfo {
     pub name: String,
-    pub created_time: Tm,
+    pub created_time: DateTime<Utc>,
 }
 
 impl BucketInfo {
@@ -146,7 +148,7 @@ impl BucketInfo {
 #[derive(Debug)]
 pub struct ObjectInfo {
     pub name: String,
-    pub modified_time: Tm,
+    pub modified_time: DateTime<Utc>,
     pub etag: String,
     pub size: i64,
     pub storage_class: String,
